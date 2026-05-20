@@ -1,16 +1,20 @@
 # =============================================================================
-# 03_Combine_HMDA_Parquet.R  (v2 - aware of character storage)
+# 03_Combine_HMDA_Parquet.R  (v3 - streaming, low memory)
 # -----------------------------------------------------------------------------
 # Purpose : Materialize the partitioned HMDA Parquet store into a single
-#           combined Parquet file. Usually NOT needed -- arrow::open_dataset()
-#           treats the folder as one logical table. Use this only when a
-#           downstream tool requires a single file or you want to hand off
-#           the full panel as one artifact.
+#           combined dataset for handoff.
 #
-# Storage note: the build (01_Build_HMDA_Parquet.R) stores all columns as
-# character to preserve HMDA "Exempt" sentinels. This script can optionally
-# cast a configured set of columns to numeric at combine time, so a handoff
-# file is immediately usable by recipients who don't know HMDA's quirks.
+# IMPORTANT: For your own analytical work you do NOT need this script.
+# arrow::open_dataset(parquet_dir) already treats the folder as one logical
+# table. Use this only when you must hand the panel to a tool or person
+# who wants a self-contained artifact.
+#
+# Design choices to avoid OOM at HMDA-LAR scale:
+#   - No global sort (arrange across files would buffer ~all data in RAM).
+#   - Output is a FOLDER of Parquet files (partitioned by src_year), not a
+#     single mega-file. Still readable as one dataset by Arrow / DuckDB /
+#     pandas / Spark / etc.
+#   - Streaming write via write_dataset() means peak RAM stays modest.
 #
 # Author  : Saurabh C. Datta
 # =============================================================================
@@ -23,12 +27,13 @@ suppressPackageStartupMessages({
 
 CONFIG <- list(
   parquet_dir       = "S:/Projects/HMDA/Time_Series/Data/parquet",
-  output_file       = "S:/Projects/HMDA/Time_Series/Data/hmda_ts_2019_2025.parquet",
+  output_dir        = "S:/Projects/HMDA/Time_Series/Data/hmda_ts_2019_2025",
   compression       = "zstd",
   compression_level = 3L,
-  sort_by_year      = TRUE,
-  # If TRUE, cast the columns in numeric_cols to double at write time.
-  # "Exempt" / non-numeric values become NULL in the output file.
+  # Partition the output by src_year. Recipients can then read just one year
+  # without scanning the whole panel.
+  partition_by_year = TRUE,
+  # Optional numeric casting -- streams through Arrow's C++ engine.
   cast_numeric      = FALSE,
   numeric_cols      = c(
     "loan_amount", "income", "interest_rate", "rate_spread",
@@ -48,25 +53,21 @@ main <- function() {
 
   message("Opening dataset: ", CONFIG$parquet_dir)
   ds <- arrow::open_dataset(CONFIG$parquet_dir, unify_schemas = TRUE)
-
   message("Schema columns: ", length(ds$schema$names))
-  message("Writing combined file to: ", CONFIG$output_file)
+  message("Output: ", CONFIG$output_dir)
+  message("Partition by year: ", CONFIG$partition_by_year)
   message("Cast numeric: ", CONFIG$cast_numeric)
 
   t0 <- Sys.time()
-
-  q <- ds
-  if (CONFIG$sort_by_year) q <- dplyr::arrange(q, src_year)
+  q  <- ds
 
   if (CONFIG$cast_numeric) {
     cols_in_data <- intersect(CONFIG$numeric_cols, ds$schema$names)
     missing      <- setdiff(CONFIG$numeric_cols, ds$schema$names)
     if (length(missing)) {
-      message("Note: these configured numeric cols are not in the dataset and ",
-              "will be skipped: ", paste(missing, collapse = ", "))
+      message("Skipping numeric cast for absent cols: ",
+              paste(missing, collapse = ", "))
     }
-    # Build a mutate() call dynamically. Arrow's cast() pushes the conversion
-    # into the C++ engine; bad values (e.g. "Exempt") become NULL.
     cast_exprs <- setNames(
       lapply(cols_in_data,
              function(c) rlang::expr(arrow::cast(!!rlang::sym(c),
@@ -76,34 +77,34 @@ main <- function() {
     q <- dplyr::mutate(q, !!!cast_exprs)
   }
 
-  tmp_dir <- file.path(dirname(CONFIG$output_file), ".combine_tmp")
-  if (dir.exists(tmp_dir)) dir_delete(tmp_dir)
-  dir_create(tmp_dir)
+  if (dir.exists(CONFIG$output_dir)) {
+    message("Removing existing output directory")
+    dir_delete(CONFIG$output_dir)
+  }
+  dir_create(CONFIG$output_dir)
 
-  # Streaming write so the full panel never has to fit in RAM at once.
-  arrow::write_dataset(
-    q,
-    path              = tmp_dir,
+  # Streaming write. No global sort. Optional Hive-style partitioning so each
+  # year becomes its own subfolder -- this is the fastest read pattern for
+  # year-filtered queries downstream.
+  write_args <- list(
+    dataset           = q,
+    path              = CONFIG$output_dir,
     format            = "parquet",
-    basename_template = "part-{i}.parquet",
-    compression       = CONFIG$compression,
-    max_rows_per_file = .Machine$integer.max   # force a single output file
+    compression       = CONFIG$compression
   )
-
-  written <- list.files(tmp_dir, pattern = "^part-0\\.parquet$",
-                        full.names = TRUE)
-  if (length(written) != 1) {
-    stop("Expected exactly one output file, got: ", length(written),
-         "\nFiles: ", paste(list.files(tmp_dir), collapse = ", "))
+  if (CONFIG$partition_by_year) {
+    write_args$partitioning <- "src_year"
   }
 
-  if (file.exists(CONFIG$output_file)) file_delete(CONFIG$output_file)
-  file_move(written, CONFIG$output_file)
-  dir_delete(tmp_dir)
+  do.call(arrow::write_dataset, write_args)
 
   elapsed <- round(difftime(Sys.time(), t0, units = "mins"), 2)
-  size_gb <- round(file.info(CONFIG$output_file)$size / 1024^3, 2)
-  message(sprintf("Done in %s min. Output size: %s GB", elapsed, size_gb))
+  size_gb <- round(sum(file.info(
+    list.files(CONFIG$output_dir, recursive = TRUE, full.names = TRUE)
+  )$size, na.rm = TRUE) / 1024^3, 2)
+
+  message(sprintf("Done in %s min. Total size: %s GB", elapsed, size_gb))
+  message("Read it back with: arrow::open_dataset('", CONFIG$output_dir, "')")
 }
 
 if (sys.nframe() == 0L) main()
